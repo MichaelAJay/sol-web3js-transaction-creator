@@ -1,0 +1,328 @@
+import { Injectable, OnModuleInit } from '@nestjs/common';
+import {
+  getCreateAccountInstruction,
+  getInitializeNonceAccountInstruction,
+  getTransferSolInstruction,
+  SYSTEM_PROGRAM_ADDRESS,
+} from '@solana-program/system';
+import {
+  createSolanaRpc,
+  sendAndConfirmTransactionFactory,
+  sendAndConfirmDurableNonceTransactionFactory,
+  KeyPairSigner,
+  Rpc,
+  SolanaRpcApiDevnet,
+  createSolanaRpcSubscriptions,
+  RpcSubscriptions,
+  SolanaRpcSubscriptionsApi,
+  createKeyPairSignerFromPrivateKeyBytes,
+  generateKeyPairSigner,
+  createTransactionMessage,
+  setTransactionMessageFeePayerSigner,
+  setTransactionMessageLifetimeUsingBlockhash,
+  appendTransactionMessageInstructions,
+  signTransactionMessageWithSigners,
+  getSignatureFromTransaction,
+  Nonce,
+  Lamports,
+  Address,
+  address,
+  setTransactionMessageLifetimeUsingDurableNonce,
+  lamports,
+  Blockhash,
+  setTransactionMessageFeePayer,
+  signTransaction,
+} from '@solana/web3.js';
+import { pipe } from '@solana/functional';
+import bs58 from 'bs58';
+
+@Injectable()
+export class AppService implements OnModuleInit {
+  serviceUrl: string;
+  rpc: Rpc<SolanaRpcApiDevnet>;
+  rpcSubscriptions: RpcSubscriptions<SolanaRpcSubscriptionsApi>;
+  authorityAndPayer: KeyPairSigner<string>;
+  recipient: KeyPairSigner<string>;
+
+  constructor() {
+    try {
+      const serviceUrl = process.env.SOLANA_RPC_SERVICE_URL;
+      if (!serviceUrl) {
+        throw new Error('Missing SOLANA_RPC_SERVICE_URL env var');
+      }
+
+      this.serviceUrl = serviceUrl;
+      this.rpc = createSolanaRpc(this.serviceUrl);
+      this.rpcSubscriptions = createSolanaRpcSubscriptions(
+        this.serviceUrl.replace('http', 'ws'),
+      );
+    } catch (err) {
+      console.error('AppService could not be initialized - exiting', err);
+      process.exit(1);
+    }
+  }
+
+  async onModuleInit() {
+    try {
+      const payerPrivateKey = process.env.PAYER_PRIVATE_KEY;
+      if (!payerPrivateKey) {
+        throw new Error('PAYER_PRIVATE_KEY missing from env vars');
+      }
+
+      this.authorityAndPayer = await createKeyPairSignerFromPrivateKeyBytes(
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+        bs58.decode(payerPrivateKey),
+      );
+    } catch (err) {
+      console.error('AppService initialized failed, exiting', err);
+      process.exit(1);
+    }
+  }
+
+  async createTransfer({
+    destination,
+    amount,
+    nonceAddress,
+  }: {
+    destination: string;
+    amount: bigint;
+    nonceAddress?: string;
+  }) {
+    try {
+      return nonceAddress
+        ? this.createNonceTransaction({
+            destination: address(destination),
+            amount: lamports(amount),
+            nonceAddressStr: nonceAddress,
+          })
+        : this.createTransaction();
+    } catch (err) {
+      console.error(err);
+      throw err;
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  private async createLegacyTransaction() {
+    throw new Error('Not implemented');
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  private async createVersionedTransaction() {
+    throw new Error('Not implemented');
+  }
+
+  private async createTransaction({
+    destination,
+    amount,
+  }: {
+    destination: Address;
+    amount: Lamports;
+  }) {
+    const recentBlockhash = await this.getLatestBlockhash();
+
+    const transferInstruction = getTransferSolInstruction({
+      amount,
+      destination,
+      source: this.authorityAndPayer,
+    });
+
+    const transactionMessage = pipe(
+      createTransactionMessage({ version: 0 }),
+      (tx) => setTransactionMessageFeePayer(this.authorityAndPayer.address, tx),
+      (tx) => setTransactionMessageLifetimeUsingBlockhash(recentBlockhash, tx),
+      (tx) => appendTransactionMessageInstructions([transferInstruction], tx),
+    );
+    // const transactionMessage = createTransactionMessage({ version: 0 });
+    // const transactionMessageWithFeePayer = setTransactionMessageFeePayer(
+    //   this.authorityAndPayer.address,
+    //   transactionMessage,
+    // );
+    // const transactionMEssageWithFeePayerAndLifetime =
+    //   setTransactionMessageLifetimeUsingBlockhash(
+    //     recentBlockhash,
+    //     transactionMessageWithFeePayer,
+    //   );
+
+    const signedTransaction =
+      await signTransactionMessageWithSigners(transactionMessage);
+
+    const sendAndConfirmTransaction = sendAndConfirmTransactionFactory({
+      rpc: this.rpc,
+      rpcSubscriptions: this.rpcSubscriptions,
+    });
+    await sendAndConfirmTransaction(signedTransaction, {
+      commitment: 'confirmed',
+    });
+  }
+
+  private async createNonceTransaction({
+    destination,
+    amount,
+    nonceAddressStr,
+  }: {
+    destination: Address;
+    amount: Lamports;
+    nonceAddressStr: string;
+  }) {
+    const transferInstruction = getTransferSolInstruction({
+      amount,
+      destination,
+      source: this.authorityAndPayer,
+    });
+
+    const nonceAccountAddress = address(nonceAddressStr);
+    const nonce = await this.getNonce(nonceAccountAddress);
+
+    /** @NOTE - probably needs advanceNonce instruction */
+    const createTransactionMsg = createTransactionMessage({ version: 0 });
+    const transferTxMessage = pipe(
+      createTransactionMsg,
+      (tx) => setTransactionMessageFeePayerSigner(this.authorityAndPayer, tx),
+      (tx) =>
+        setTransactionMessageLifetimeUsingDurableNonce(
+          {
+            nonce,
+            nonceAccountAddress,
+            nonceAuthorityAddress: this.authorityAndPayer.address,
+          },
+          tx,
+        ),
+      (tx) => appendTransactionMessageInstructions([transferInstruction], tx),
+    );
+
+    // Sign & send
+    const signedTransferNonceTx =
+      await signTransactionMessageWithSigners(transferTxMessage);
+    const sendAndConfirmNonceTransaction =
+      sendAndConfirmDurableNonceTransactionFactory({
+        rpc: this.rpc,
+        rpcSubscriptions: this.rpcSubscriptions,
+      });
+
+    await sendAndConfirmNonceTransaction(signedTransferNonceTx, {
+      commitment: 'confirmed',
+    });
+
+    console.log(
+      'Transfer Tx Signature:',
+      getSignatureFromTransaction(signedTransferNonceTx),
+    );
+    console.log('Nonce-based transfer succeeded!');
+  }
+
+  async createNonceAccount() {
+    const nonceAccount = await generateKeyPairSigner();
+
+    // Get the min balance for rent exemption
+    const space = 80n;
+    const lamportsForRent = await this.rpc
+      .getMinimumBalanceForRentExemption(space)
+      .send();
+
+    // Build the tx
+    const createAccountInstruction = getCreateAccountInstruction({
+      payer: this.authorityAndPayer,
+      newAccount: nonceAccount,
+      lamports: lamportsForRent,
+      space,
+      programAddress: SYSTEM_PROGRAM_ADDRESS,
+    });
+
+    const initializeNonceAccountInstruction =
+      getInitializeNonceAccountInstruction({
+        nonceAccount: nonceAccount.address,
+        nonceAuthority: this.authorityAndPayer.address,
+      });
+
+    const { blockhash: nonceCreateBlockhash, lastValidBlockHeight } =
+      await this.getLatestBlockhash();
+
+    const createNonceTxMessage = pipe(
+      createTransactionMessage({ version: 'legacy' }),
+      (tx) => setTransactionMessageFeePayerSigner(this.authorityAndPayer, tx),
+      (tx) =>
+        setTransactionMessageLifetimeUsingBlockhash(
+          { blockhash: nonceCreateBlockhash, lastValidBlockHeight },
+          tx,
+        ),
+      (tx) =>
+        appendTransactionMessageInstructions(
+          [createAccountInstruction, initializeNonceAccountInstruction],
+          tx,
+        ),
+    );
+
+    // Sign & send
+    const signedCreateNonceTx =
+      await signTransactionMessageWithSigners(createNonceTxMessage);
+
+    const sendAndConfirmTransaction = sendAndConfirmTransactionFactory({
+      rpc: this.rpc,
+      rpcSubscriptions: this.rpcSubscriptions,
+    });
+    await sendAndConfirmTransaction(signedCreateNonceTx, {
+      commitment: 'confirmed',
+    });
+
+    console.log('Nonce account created at:', nonceAccount.address);
+    console.log(
+      'Creation Tx Signature:',
+      getSignatureFromTransaction(signedCreateNonceTx),
+    );
+    const output = this.serializeCryptoKey(nonceAccount.keyPair.privateKey);
+    return output;
+  }
+
+  // Helpers
+  /**
+   *
+   * @returns {GetLatestBlockhashRet}
+   */
+  private async getLatestBlockhash() {
+    const { value } = await this.rpc
+      .getLatestBlockhash({ commitment: 'confirmed' })
+      .send();
+    return value;
+  }
+
+  private async serializeCryptoKey(cryptoKey: CryptoKey) {
+    const exportedPrivateKey = await crypto.subtle.exportKey('raw', cryptoKey);
+    const privateKeyBytes = new Uint8Array(exportedPrivateKey);
+    const serializedPrivateKey = this.bs58EncodeBytes(privateKeyBytes);
+    return serializedPrivateKey;
+  }
+
+  private bs58EncodeBytes(bytes: Uint8Array<ArrayBuffer>) {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+    const bs58String = bs58.encode(bytes);
+    if (typeof bs58String !== 'string') {
+      throw new Error('Could not bs58-encode bytes');
+    }
+    return bs58String;
+  }
+
+  private async getNonce(nonceAddress: Address<string>) {
+    const NONCE_VALUE_OFFSET = 4 + 4 + 32;
+    const { value: nonceAccountInfo } = await this.rpc
+      .getAccountInfo(nonceAddress, {
+        dataSlice: { offset: NONCE_VALUE_OFFSET, length: 32 },
+        encoding: 'base58',
+      })
+      .send();
+
+    if (!nonceAccountInfo?.data || !nonceAccountInfo.data[0]) {
+      throw new Error('Failed to read the new nonce from the account');
+    }
+
+    const base58Nonce = nonceAccountInfo.data[0] as string;
+    const nonce = base58Nonce as Nonce<string>;
+    console.log('Fetched new nonce for second transaction:', base58Nonce);
+    return nonce;
+  }
+}
+
+type GetLatestBlockhashRet = {
+  blockhash: Blockhash;
+  lastValidBlockHeight: bigint;
+};

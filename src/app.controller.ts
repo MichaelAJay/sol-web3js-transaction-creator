@@ -1,23 +1,20 @@
 import { Body, Controller, Post } from '@nestjs/common';
 import { AppService } from './app.service';
+import { PostTransactionDto } from './dtos/post-transaction.dto';
 
 @Controller()
 export class AppController {
   constructor(private readonly appService: AppService) {}
 
-  @Post()
+  @Post('transaction')
   createTransfer(
     @Body()
-    body: {
-      destination: string;
-      amount: bigint;
-      nonceAddress?: string | undefined;
-    },
+    body: PostTransactionDto,
   ): any {
     return this.appService.createTransfer(body);
   }
 
-  @Post()
+  @Post('create-nonce-acct')
   createNonceAccount(): any {
     return this.appService.createNonceAccount();
   }

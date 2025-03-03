@@ -29,9 +29,7 @@ import {
   address,
   setTransactionMessageLifetimeUsingDurableNonce,
   lamports,
-  Blockhash,
   setTransactionMessageFeePayer,
-  signTransaction,
 } from '@solana/web3.js';
 import { pipe } from '@solana/functional';
 import bs58 from 'bs58';
@@ -42,6 +40,7 @@ export class AppService implements OnModuleInit {
   rpc: Rpc<SolanaRpcApiDevnet>;
   rpcSubscriptions: RpcSubscriptions<SolanaRpcSubscriptionsApi>;
   authorityAndPayer: KeyPairSigner<string>;
+  receiver: KeyPairSigner<string>;
   recipient: KeyPairSigner<string>;
 
   constructor() {
@@ -65,14 +64,28 @@ export class AppService implements OnModuleInit {
   async onModuleInit() {
     try {
       const payerPrivateKey = process.env.PAYER_PRIVATE_KEY;
-      if (!payerPrivateKey) {
+      const receiverPrivateKey = process.env.RECEIVER_PRIVATE_KEY;
+      if (!(payerPrivateKey && receiverPrivateKey)) {
         throw new Error('PAYER_PRIVATE_KEY missing from env vars');
       }
 
-      this.authorityAndPayer = await createKeyPairSignerFromPrivateKeyBytes(
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
-        bs58.decode(payerPrivateKey),
+      const [authorityAndPayer, receiver] = await Promise.all(
+        [payerPrivateKey, receiverPrivateKey].map(async (key) => {
+          return await createKeyPairSignerFromPrivateKeyBytes(
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+            bs58.decode(key),
+          );
+        }),
       );
+
+      this.authorityAndPayer = authorityAndPayer;
+      this.receiver = receiver;
+
+      console.log(
+        'Authority & payer initialized, address:',
+        this.authorityAndPayer.address,
+      );
+      console.log('Receiver initialized, address:', this.receiver.address);
     } catch (err) {
       console.error('AppService initialized failed, exiting', err);
       process.exit(1);
@@ -83,21 +96,36 @@ export class AppService implements OnModuleInit {
     destination,
     amount,
     nonceAddress,
+    version,
   }: {
     destination: string;
-    amount: bigint;
+    amount: number;
     nonceAddress?: string;
+    version: 0 | 'legacy';
   }) {
+    const bigIntAmt = amount as unknown as bigint;
     try {
       return nonceAddress
-        ? this.createNonceTransaction({
+        ? await this.createNonceTransaction({
             destination: address(destination),
-            amount: lamports(amount),
+            amount: lamports(bigIntAmt),
             nonceAddressStr: nonceAddress,
+            version,
+            keypairSigner: this.authorityAndPayer,
           })
-        : this.createTransaction();
+        : await this.createTransaction({
+            destination: address(destination),
+            amount: lamports(bigIntAmt),
+            version,
+          });
     } catch (err) {
-      console.error(err);
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+      if (err.message.includes('is no longer valid. It has advanced to')) {
+        const msg = 'Notification error bug detected. Gracefully handling.';
+        console.log(msg);
+        return msg;
+      }
+      console.error('err', err);
       throw err;
     }
   }
@@ -115,9 +143,11 @@ export class AppService implements OnModuleInit {
   private async createTransaction({
     destination,
     amount,
+    version,
   }: {
     destination: Address;
     amount: Lamports;
+    version: 0 | 'legacy';
   }) {
     const recentBlockhash = await this.getLatestBlockhash();
 
@@ -128,21 +158,12 @@ export class AppService implements OnModuleInit {
     });
 
     const transactionMessage = pipe(
-      createTransactionMessage({ version: 0 }),
-      (tx) => setTransactionMessageFeePayer(this.authorityAndPayer.address, tx),
+      createTransactionMessage({ version }),
+      // (tx) => setTransactionMessageFeePayer(this.authorityAndPayer.address, tx),
+      (tx) => setTransactionMessageFeePayerSigner(this.authorityAndPayer, tx),
       (tx) => setTransactionMessageLifetimeUsingBlockhash(recentBlockhash, tx),
       (tx) => appendTransactionMessageInstructions([transferInstruction], tx),
     );
-    // const transactionMessage = createTransactionMessage({ version: 0 });
-    // const transactionMessageWithFeePayer = setTransactionMessageFeePayer(
-    //   this.authorityAndPayer.address,
-    //   transactionMessage,
-    // );
-    // const transactionMEssageWithFeePayerAndLifetime =
-    //   setTransactionMessageLifetimeUsingBlockhash(
-    //     recentBlockhash,
-    //     transactionMessageWithFeePayer,
-    //   );
 
     const signedTransaction =
       await signTransactionMessageWithSigners(transactionMessage);
@@ -154,31 +175,34 @@ export class AppService implements OnModuleInit {
     await sendAndConfirmTransaction(signedTransaction, {
       commitment: 'confirmed',
     });
+    return getSignatureFromTransaction(signedTransaction);
   }
 
   private async createNonceTransaction({
     destination,
     amount,
     nonceAddressStr,
+    version,
+    keypairSigner,
   }: {
     destination: Address;
     amount: Lamports;
     nonceAddressStr: string;
+    version: 0 | 'legacy';
+    keypairSigner: KeyPairSigner<string>;
   }) {
     const transferInstruction = getTransferSolInstruction({
       amount,
       destination,
-      source: this.authorityAndPayer,
+      source: keypairSigner,
     });
 
     const nonceAccountAddress = address(nonceAddressStr);
     const nonce = await this.getNonce(nonceAccountAddress);
-
-    /** @NOTE - probably needs advanceNonce instruction */
-    const createTransactionMsg = createTransactionMessage({ version: 0 });
+    const createTransactionMsg = createTransactionMessage({ version });
     const transferTxMessage = pipe(
       createTransactionMsg,
-      (tx) => setTransactionMessageFeePayerSigner(this.authorityAndPayer, tx),
+      (tx) => setTransactionMessageFeePayerSigner(this.receiver, tx),
       (tx) =>
         setTransactionMessageLifetimeUsingDurableNonce(
           {
@@ -239,7 +263,7 @@ export class AppService implements OnModuleInit {
       await this.getLatestBlockhash();
 
     const createNonceTxMessage = pipe(
-      createTransactionMessage({ version: 'legacy' }),
+      createTransactionMessage({ version: 0 }),
       (tx) => setTransactionMessageFeePayerSigner(this.authorityAndPayer, tx),
       (tx) =>
         setTransactionMessageLifetimeUsingBlockhash(
@@ -270,27 +294,15 @@ export class AppService implements OnModuleInit {
       'Creation Tx Signature:',
       getSignatureFromTransaction(signedCreateNonceTx),
     );
-    const output = this.serializeCryptoKey(nonceAccount.keyPair.privateKey);
-    return output;
+    return nonceAccount.address as string;
   }
 
   // Helpers
-  /**
-   *
-   * @returns {GetLatestBlockhashRet}
-   */
   private async getLatestBlockhash() {
     const { value } = await this.rpc
       .getLatestBlockhash({ commitment: 'confirmed' })
       .send();
     return value;
-  }
-
-  private async serializeCryptoKey(cryptoKey: CryptoKey) {
-    const exportedPrivateKey = await crypto.subtle.exportKey('raw', cryptoKey);
-    const privateKeyBytes = new Uint8Array(exportedPrivateKey);
-    const serializedPrivateKey = this.bs58EncodeBytes(privateKeyBytes);
-    return serializedPrivateKey;
   }
 
   private bs58EncodeBytes(bytes: Uint8Array<ArrayBuffer>) {
@@ -321,8 +333,3 @@ export class AppService implements OnModuleInit {
     return nonce;
   }
 }
-
-type GetLatestBlockhashRet = {
-  blockhash: Blockhash;
-  lastValidBlockHeight: bigint;
-};

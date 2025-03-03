@@ -29,7 +29,6 @@ import {
   address,
   setTransactionMessageLifetimeUsingDurableNonce,
   lamports,
-  setTransactionMessageFeePayer,
 } from '@solana/web3.js';
 import { pipe } from '@solana/functional';
 import bs58 from 'bs58';
